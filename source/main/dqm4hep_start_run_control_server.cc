@@ -1,7 +1,7 @@
-  /// \file dqm4hep_start_analysis_module.cc
+  /// \file dqm4hep_start_run_control_server.cc
 /*
  *
- * dqm4hep_start_analysis_module.cc main source file template automatically generated
+ * dqm4hep_start_run_control_server.cc main source file template automatically generated
  * Creation date : mer. nov. 5 2014
  *
  * This file is part of DQM4HEP libraries.
@@ -28,8 +28,8 @@
 // -- dqm4hep headers
 #include "dqm4hep/DQM4HEP.h"
 #include "dqm4hep/DQMLogging.h"
-#include "dqm4hep/DQMPluginManager.h"
-#include "dqm4hep/DQMAnalysisModuleApplication.h"
+#include "dqm4hep/DQMCoreTool.h"
+#include "dqm4hep/DQMRunControlService.h"
 
 // -- tclap headers
 #include "tclap/CmdLine.h"
@@ -39,36 +39,24 @@
 #include <iostream>
 #include <signal.h>
 
-// -- root headers
-#include "TObject.h"
+#ifdef DQM4HEP_USE_MONGOOSE
+#include <mongoose/Server.h>
+#endif
 
 using namespace std;
 using namespace dqm4hep;
 
-DQMAnalysisModuleApplication *pApplication = NULL;
-
-// simple function to exit the program
-void exit_application(int returnCode)
-{
-	LOG4CXX_WARN( dqmMainLogger , "Exiting analysis module application !" );
-
-	if(NULL != pApplication)
-		pApplication->exit( returnCode );
-	else
-		exit(0);
-}
+bool process = true;
 
 //-------------------------------------------------------------------------------------------------
 
 // key interrupt signal handling
 void int_key_signal_handler(int signal)
 {
-	if(NULL == pApplication)
-		exit(0);
-
 	LOG4CXX_WARN( dqmMainLogger , "*** SIGN INT ***" );
 	LOG4CXX_WARN( dqmMainLogger , "Caught signal " << signal << ". Stopping the application." );
-	exit_application( static_cast<int>(STATUS_CODE_SUCCESS) );
+
+	process = false;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -76,36 +64,8 @@ void int_key_signal_handler(int signal)
 // segmentation violation signal handling
 void seg_viol_signal_handling(int signal)
 {
-	if(NULL == pApplication)
-		exit(1);
-
 	LOG4CXX_WARN( dqmMainLogger , "*** SIGN VIOL ***" );
 	LOG4CXX_WARN( dqmMainLogger , "Caught signal " << signal << ". Stopping the application." );
-	exit_application( static_cast<int>(STATUS_CODE_INVALID_PTR) );
-}
-
-//-------------------------------------------------------------------------------------------------
-
-void parseParameterArg(const std::vector<std::string> &args, DQMParameters &parametersMap)
-{
-	for(auto iter = args.begin(), endIter = args.end() ; endIter != iter ; ++iter)
-	{
-		std::string arg(*iter);
-		size_t pos = arg.find_first_of("=");
-
-		if(pos == std::string::npos)
-		{
-			LOG4CXX_WARN( dqmMainLogger, "Parameter '" << arg << "' : wrong parsing !" );
-			continue;
-		}
-
-		std::string key = arg.substr(0, pos);
-		std::string value = arg.substr(pos+1);
-
-		parametersMap[ key ] = value;
-
-		LOG4CXX_DEBUG( dqmMainLogger, "Read key '" << key << "' , value '" << value << "'" );
-	}
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -113,25 +73,33 @@ void parseParameterArg(const std::vector<std::string> &args, DQMParameters &para
 int main(int argc, char* argv[])
 {
 	DQM4HEP::screenSplash();
-	TObject::SetObjectStat(false);
 
 	std::string cmdLineFooter = "Please report bug to <rete@ipnl.in2p3.fr>";
 	TCLAP::CmdLine *pCommandLine = new TCLAP::CmdLine(cmdLineFooter, ' ', DQM4HEP_VERSION_STR);
 	std::string log4cxx_file = std::string(DQMCore_DIR) + "/conf/defaultLoggerConfig.xml";
 
-	TCLAP::ValueArg<std::string> steeringFileNameArg(
-				  "f"
-				 , "steering-file"
-				 , "The xml steering file for the module application"
+	TCLAP::ValueArg<std::string> runControlNameArg(
+				  "r"
+				 , "run-control-name"
+				 , "The run control name"
 				 , true
 				 , ""
 				 , "string");
-	pCommandLine->add(steeringFileNameArg);
+	pCommandLine->add(runControlNameArg);
+
+	TCLAP::ValueArg<std::string> passwordArg(
+				  "k"
+				 , "password"
+				 , "The run control password to execute command from interfaces"
+				 , false
+				 , ""
+				 , "string");
+	pCommandLine->add(passwordArg);
 
 	TCLAP::ValueArg<std::string> loggerConfigArg(
 				  "l"
-				 , "logger-config"
-				 , "The xml logger file to configure log4cxx"
+				 , "logger-file"
+				 , "The log4cxx logger xml file"
 				 , false
 				 , log4cxx_file
 				 , "string");
@@ -157,16 +125,19 @@ int main(int argc, char* argv[])
 				 , &allowedLevelsContraint);
 	pCommandLine->add(verbosityArg);
 
-	TCLAP::MultiArg<std::string> parameterArg(
+
+#ifdef DQM4HEP_USE_MONGOOSE
+	TCLAP::ValueArg<unsigned int> httpPortArg(
 				  "p"
-				 , "parameter"
-				 , "A parameter to replace in the application (see DQMXmlHelper)"
+				 , "http-port"
+				 , "The http port to listen on (with mongoose)"
 				 , false
-				 , "");
-	pCommandLine->add(parameterArg);
+				 , 8082
+				 , "unsigned int");
+	pCommandLine->add(httpPortArg);
+#endif
 
 	// parse command line
-	std::cout << "dqm4hep_start_analysis_module: Parsing command line ..." << std::endl;
 	pCommandLine->parse(argc, argv);
 
 	log4cxx_file = loggerConfigArg.getValue();
@@ -175,55 +146,51 @@ int main(int argc, char* argv[])
 	if( verbosityArg.isSet() )
 		dqmMainLogger->setLevel( log4cxx::Level::toLevel( verbosityArg.getValue() ) );
 
-	DQMParameters parametersMap;
-	parseParameterArg( parameterArg.getValue() , parametersMap );
-
 	// install signal handlers
 	LOG4CXX_INFO( dqmMainLogger , "Installing signal handlers ..." );
 	signal(SIGINT,  int_key_signal_handler);
+//	signal(SIGSEGV, seg_viol_signal_handling);
 
-	LOG4CXX_INFO( dqmMainLogger , "Creating analysis module application ..." );
 
-	try
-	{
-		// load plugins is env var is set
-		THROW_RESULT_IF(STATUS_CODE_SUCCESS, !=, DQMPluginManager::instance()->loadLibraries());
+	std::string runControlName( runControlNameArg.getValue() );
+	std::string password( passwordArg.getValue() );
 
-		pApplication = new DQMAnalysisModuleApplication();
-	}
-	catch(StatusCodeException &exception)
-	{
-		LOG4CXX_FATAL( dqmMainLogger , "StatusCodeException caught : " << exception.toString() );
-		exit_application( exception.getStatusCode() );
-	}
+	DQMRunControlService runControlServer;
 
-	LOG4CXX_INFO( dqmMainLogger , "Creating analysis module application ... OK" );
-	LOG4CXX_INFO( dqmMainLogger , "Module application read settings ..." );
+	runControlServer.setRunControlName(runControlName);
+	runControlServer.setPassword(password);
 
-	try
-	{
-		pApplication->setReplacementParameters( parametersMap );
-		THROW_RESULT_IF(STATUS_CODE_SUCCESS, !=, pApplication->readSettings(steeringFileNameArg.getValue()));
-	}
-	catch(StatusCodeException &exception)
-	{
-		LOG4CXX_FATAL( dqmMainLogger , "StatusCodeException caught : " << exception.toString() );
-		exit_application( exception.getStatusCode() );
-	}
+#ifdef DQM4HEP_USE_MONGOOSE
+	Server server( httpPortArg.getValue() );
+	server.registerController( &runControlServer );
+	server.start();
 
-	LOG4CXX_INFO( dqmMainLogger , "Module application read settings ... OK" );
-	LOG4CXX_INFO( dqmMainLogger , "Running module application ..." );
+	runControlServer.dumpRoutes();
+#endif
 
 	try
 	{
-		THROW_RESULT_IF(STATUS_CODE_SUCCESS, !=, pApplication->run());
+		THROW_RESULT_IF( STATUS_CODE_SUCCESS , !=, runControlServer.start() );
+
+		DimServer::start(  ("DQM4HEP/RunControl/" + runControlName).c_str() );
+
+		while( process )
+			DQMCoreTool::sleep(std::chrono::seconds(1));
 	}
 	catch(StatusCodeException &exception)
 	{
-		LOG4CXX_FATAL( dqmMainLogger , "StatusCodeException caught : " << exception.toString() );
-		exit_application( exception.getStatusCode() );
+		LOG4CXX_ERROR( dqmMainLogger , "Couldn't start run control server : " << exception.toString() );
+
+#ifdef DQM4HEP_USE_MONGOOSE
+		server.stop();
+#endif
+
+		return 1;
 	}
 
-	delete pCommandLine;
-	exit_application( static_cast<int>(STATUS_CODE_SUCCESS) );
+#ifdef DQM4HEP_USE_MONGOOSE
+		server.stop();
+#endif
+
+	return 0;
 }
